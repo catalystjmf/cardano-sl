@@ -38,7 +38,7 @@ import           Pos.Chain.Ssc (HasSscConfiguration, HasSscContext (..),
                      mkSignedCommitment, mkVssCertificate, mpcSendInterval,
                      randCommitmentAndOpening, scBehavior, scParticipateSsc,
                      scVssKeyPair, sgsCommitments, vssThreshold)
-import           Pos.Chain.Update (BlockVersionData (..))
+import           Pos.Chain.Update (BlockVersionData (..), ConsensusEra (..))
 import           Pos.Core (BlockCount, EpochIndex, HasPrimaryKey, SlotId (..),
                      StakeholderId, Timestamp (..), getOurSecretKey,
                      getOurStakeholderId, getSlotIndex, kEpochSlots,
@@ -51,13 +51,14 @@ import           Pos.Crypto (SecretKey, VssKeyPair, VssPublicKey, randomNumber,
                      randomNumberInRange, runSecureRandom, vssKeyGen)
 import           Pos.Crypto.SecretSharing (toVssPublicKey)
 import           Pos.DB (gsAdoptedBVData)
-import           Pos.DB.Class (MonadDB, MonadGState)
+import           Pos.DB.Class (MonadDB, MonadDBRead, MonadGState)
 import           Pos.DB.Lrc (HasLrcContext, getSscRichmen)
 import           Pos.DB.Ssc (getGlobalCerts, getStableCerts,
                      sscGarbageCollectLocalData, sscGetGlobalState,
                      sscProcessCertificate, sscProcessCommitment,
                      sscProcessOpening, sscProcessShares)
 import qualified Pos.DB.Ssc.SecretStorage as SS
+import           Pos.DB.Update (getConsensusEra)
 import           Pos.Infra.Diffusion.Types (Diffusion (..))
 import           Pos.Infra.Recovery.Info (MonadRecoveryInfo, recoveryCommGuard)
 import           Pos.Infra.Shutdown (HasShutdownContext)
@@ -67,7 +68,7 @@ import           Pos.Infra.Util.LogSafe (logDebugS, logErrorS, logInfoS,
                      logWarningS)
 import           Pos.Util.AssertMode (inAssertMode)
 import           Pos.Util.Util (HasLens (..), getKeys, intords, leftToPanic)
-import           Pos.Util.Wlog (WithLogger)
+import           Pos.Util.Wlog (WithLogger, logDebug)
 
 
 type SscMode ctx m
@@ -103,6 +104,18 @@ sscWorkers genesisConfig =
     , ("ssc check for ignored", checkForIgnoredCommitmentsWorker genesisConfig)
     ]
 
+-- | Wrap a single-argument function in a check which only runs when we are
+-- in the OBFT ConsensusEra.
+whenOriginalEra :: (MonadDBRead m, WithLogger m) => m () -> m ()
+whenOriginalEra k = do
+    era <- getConsensusEra
+    case era of
+        Original -> do
+            logDebug $ sformat ("whenOriginalEra: we are in era "%shown%"; running SSC") era
+            k
+        OBFT _   ->
+            logDebug $ sformat ("whenOriginalEra: we are in era "%shown%"; not running SSC") era
+
 shouldParticipate :: SscMode ctx m => BlockVersionData -> EpochIndex -> m Bool
 shouldParticipate genesisBvd epoch = do
     richmen <- getSscRichmen genesisBvd "shouldParticipate" epoch
@@ -122,15 +135,16 @@ onNewSlotSsc
     -> Diffusion m
     -> m ()
 onNewSlotSsc genesisConfig diffusion = onNewSlot (configEpochSlots genesisConfig) defaultOnNewSlotParams $ \slotId ->
-    recoveryCommGuard (configBlkSecurityParam genesisConfig) "onNewSlot worker in SSC" $ do
-        sscGarbageCollectLocalData slotId
-        whenM (shouldParticipate (configBlockVersionData genesisConfig) $ siEpoch slotId) $ do
-            behavior <- view sscContext >>=
-                (readTVarIO . scBehavior)
-            checkNSendOurCert genesisConfig (sendSscCert diffusion)
-            onNewSlotCommitment genesisConfig slotId (sendSscCommitment diffusion)
-            onNewSlotOpening genesisConfig (sbSendOpening behavior) slotId (sendSscOpening diffusion)
-            onNewSlotShares genesisConfig (sbSendShares behavior) slotId (sendSscShares diffusion)
+    whenOriginalEra $
+        recoveryCommGuard (configBlkSecurityParam genesisConfig) "onNewSlot worker in SSC" $ do
+            sscGarbageCollectLocalData slotId
+            whenM (shouldParticipate (configBlockVersionData genesisConfig) $ siEpoch slotId) $ do
+                behavior <- view sscContext >>=
+                    (readTVarIO . scBehavior)
+                checkNSendOurCert genesisConfig (sendSscCert diffusion)
+                onNewSlotCommitment genesisConfig slotId (sendSscCommitment diffusion)
+                onNewSlotOpening genesisConfig (sbSendOpening behavior) slotId (sendSscOpening diffusion)
+                onNewSlotShares genesisConfig (sbSendShares behavior) slotId (sendSscShares diffusion)
 
 -- CHECK: @checkNSendOurCert
 -- Checks whether 'our' VSS certificate has been announced
@@ -458,7 +472,7 @@ checkForIgnoredCommitmentsWorker
     => Genesis.Config
     -> Diffusion m
     -> m ()
-checkForIgnoredCommitmentsWorker genesisConfig _ = do
+checkForIgnoredCommitmentsWorker genesisConfig _ = whenOriginalEra $ do
     counter <- newTVarIO 0
     onNewSlot (configEpochSlots genesisConfig)
               defaultOnNewSlotParams
